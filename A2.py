@@ -12,7 +12,13 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from sklearn.model_selection import ParameterGrid, train_test_split
+from sklearn.model_selection import (
+    GridSearchCV,
+    ParameterGrid,
+    cross_val_score,
+    train_test_split,
+    validation_curve,
+)
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -181,6 +187,29 @@ def build_preprocessor(
 
 
 # %%
+def build_model_pipeline(
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+    scale_numeric: bool,
+    model,
+) -> Pipeline:
+    """Wrap preprocessing and an estimator into one leakage-safe pipeline."""
+    return Pipeline(
+        steps=[
+            (
+                "preprocessor",
+                build_preprocessor(
+                    numeric_cols=numeric_cols,
+                    categorical_cols=categorical_cols,
+                    scale_numeric=scale_numeric,
+                ),
+            ),
+            ("model", model),
+        ]
+    )
+
+
+# %%
 def preprocess_data(
     df: pd.DataFrame,
     use_engineered_features: bool = True,
@@ -247,72 +276,190 @@ def preprocess_data(
     }
 
 
-# %%
-def tune_gbdt_hyperparameters(X_train, y_train, X_val, y_val) -> tuple[pd.DataFrame, dict, XGBClassifier]:
+def tune_gbdt_hyperparameters(
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+) -> tuple[pd.DataFrame, dict, Pipeline]:
     """Tune GBDT hyperparameters on the train/validation split."""
     param_grid = {
-        "learning_rate": [0.01, 0.1, 0.3],
-        "n_estimators": [100, 300],
-        "max_depth": [3, 6],
-        "subsample": [0.8, 1.0],
-        "reg_alpha": [0.0],
-        "reg_lambda": [1.0, 5.0],
+        "model__learning_rate": [0.01, 0.1, 0.3],
+        "model__n_estimators": [100, 300],
+        "model__max_depth": [3, 6],
+        "model__subsample": [0.8, 1.0],
+        "model__reg_alpha": [0.0, 0.1, 0.5],
+        "model__reg_lambda": [0.5, 1.0, 5.0],
     }
 
-    tuning_results = []
-    best_metrics = None
-    best_model = None
-
-    for params in ParameterGrid(param_grid):
-        model = XGBClassifier(
+    base_pipeline = build_model_pipeline(
+        numeric_cols=numeric_cols,
+        categorical_cols=categorical_cols,
+        scale_numeric=False,
+        model=XGBClassifier(
             objective="binary:logistic",
             eval_metric="logloss",
             colsample_bytree=1.0,
             random_state=42,
-            **params,
-        )
-
-        start_time = time.time()
-        model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_train, y_train), (X_val, y_val)],
-            verbose=False,
-        )
-        train_time = time.time() - start_time
-
-        y_val_pred = model.predict(X_val)
-        y_val_proba = model.predict_proba(X_val)[:, 1]
-
-        result = {
-            **params,
-            "accuracy": accuracy_score(y_val, y_val_pred),
-            "precision": precision_score(y_val, y_val_pred),
-            "recall": recall_score(y_val, y_val_pred),
-            "f1": f1_score(y_val, y_val_pred),
-            "auc_pr": average_precision_score(y_val, y_val_proba),
-            "train_time_sec": train_time,
-        }
-        tuning_results.append(result)
-
-        if (
-            best_metrics is None
-            or result["f1"] > best_metrics["f1"]
-            or (
-                result["f1"] == best_metrics["f1"]
-                and result["auc_pr"] > best_metrics["auc_pr"]
-            )
-        ):
-            best_metrics = result
-            best_model = model
-
-    results_df = (
-        pd.DataFrame(tuning_results)
-        .sort_values(["f1", "auc_pr"], ascending=False)
-        .reset_index(drop=True)
+        ),
     )
 
-    return results_df, best_metrics, best_model
+    grid_search = GridSearchCV(
+        estimator=base_pipeline,
+        param_grid=param_grid,
+        scoring="f1",
+        cv=3,
+        n_jobs=-1,
+        refit=True,
+    )
+
+    start_time = time.time()
+    grid_search.fit(X_train, y_train)
+    total_search_time = time.time() - start_time
+
+    results_df = pd.DataFrame(grid_search.cv_results_)
+    results_df = results_df[
+        [
+            "param_model__learning_rate",
+            "param_model__n_estimators",
+            "param_model__max_depth",
+            "param_model__subsample",
+            "param_model__reg_alpha",
+            "param_model__reg_lambda",
+            "mean_test_score",
+            "std_test_score",
+            "rank_test_score",
+        ]
+    ].rename(
+        columns={
+            "param_model__learning_rate": "learning_rate",
+            "param_model__n_estimators": "n_estimators",
+            "param_model__max_depth": "max_depth",
+            "param_model__subsample": "subsample",
+            "param_model__reg_alpha": "reg_alpha",
+            "param_model__reg_lambda": "reg_lambda",
+            "mean_test_score": "cv_f1",
+            "std_test_score": "cv_f1_std",
+        }
+    )
+
+    best_pipeline = grid_search.best_estimator_
+    best_params = {
+        key.replace("model__", ""): value for key, value in grid_search.best_params_.items()
+    }
+    y_val_pred = best_pipeline.predict(X_val)
+    y_val_proba = best_pipeline.predict_proba(X_val)[:, 1]
+
+    best_metrics = {
+        **best_params,
+        "accuracy": accuracy_score(y_val, y_val_pred),
+        "precision": precision_score(y_val, y_val_pred, zero_division=0),
+        "recall": recall_score(y_val, y_val_pred, zero_division=0),
+        "f1": f1_score(y_val, y_val_pred, zero_division=0),
+        "auc_pr": average_precision_score(y_val, y_val_proba),
+        "train_time_sec": grid_search.refit_time_,
+        "search_time_sec": total_search_time,
+    }
+
+    validation_rows = []
+    raw_param_grid = {
+        "learning_rate": [0.01, 0.1, 0.3],
+        "n_estimators": [100, 300],
+        "max_depth": [3, 6],
+        "subsample": [0.8, 1.0],
+        "reg_alpha": [0.0, 0.1, 0.5],
+        "reg_lambda": [0.5, 1.0, 5.0],
+    }
+    for params in ParameterGrid(raw_param_grid):
+        pipeline = build_model_pipeline(
+            numeric_cols=numeric_cols,
+            categorical_cols=categorical_cols,
+            scale_numeric=False,
+            model=XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="logloss",
+                colsample_bytree=1.0,
+                random_state=42,
+                **params,
+            ),
+        )
+        train_start_time = time.time()
+        pipeline.fit(X_train, y_train)
+        train_time = time.time() - train_start_time
+
+        y_train_pred = pipeline.predict(X_train)
+        y_val_pred = pipeline.predict(X_val)
+        y_val_proba = pipeline.predict_proba(X_val)[:, 1]
+
+        validation_rows.append(
+            {
+                **params,
+                "train_accuracy": accuracy_score(y_train, y_train_pred),
+                "train_f1": f1_score(y_train, y_train_pred, zero_division=0),
+                "accuracy": accuracy_score(y_val, y_val_pred),
+                "precision": precision_score(y_val, y_val_pred, zero_division=0),
+                "recall": recall_score(y_val, y_val_pred, zero_division=0),
+                "f1": f1_score(y_val, y_val_pred, zero_division=0),
+                "auc_pr": average_precision_score(y_val, y_val_proba),
+                "train_time_sec": train_time,
+            }
+        )
+
+    validation_results_df = pd.DataFrame(validation_rows)
+    results_df = results_df.merge(
+        validation_results_df,
+        on=["learning_rate", "n_estimators", "max_depth", "subsample", "reg_alpha", "reg_lambda"],
+        how="left",
+    )
+    results_df = results_df.sort_values(["f1", "auc_pr"], ascending=False).reset_index(drop=True)
+
+    return results_df, best_metrics, best_pipeline
+
+
+# %%
+def summarize_gbdt_parameter_effects(results_df: pd.DataFrame, parameter_name: str) -> pd.DataFrame:
+    """Summarize how one GBDT hyperparameter affects performance and overfitting."""
+    summary_df = (
+        results_df.groupby(parameter_name, as_index=False)
+        .agg(
+            mean_train_f1=("train_f1", "mean"),
+            mean_val_f1=("f1", "mean"),
+            mean_val_auc_pr=("auc_pr", "mean"),
+            mean_precision=("precision", "mean"),
+            mean_recall=("recall", "mean"),
+        )
+        .round(4)
+    )
+    summary_df["overfit_gap_f1"] = (
+        summary_df["mean_train_f1"] - summary_df["mean_val_f1"]
+    ).round(4)
+    return summary_df
+
+
+# %%
+def plot_gbdt_parameter_summary_table(summary_df: pd.DataFrame, parameter_name: str):
+    """Render one GBDT parameter-effect summary as a matplotlib table."""
+    fig, ax = plt.subplots(figsize=(11, 2.6))
+    ax.axis("off")
+    table = ax.table(
+        cellText=summary_df.values,
+        colLabels=summary_df.columns,
+        cellLoc="center",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.5)
+    ax.set_title(f"GBDT Parameter Effect Summary: {parameter_name}", pad=12)
+    plt.tight_layout()
+    plt.savefig(
+        VIS_DIR / f"gbdt_parameter_summary_{parameter_name}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.show()
 
 
 # %%
@@ -330,9 +477,9 @@ def tune_decision_threshold(
         result = {
             "threshold": threshold,
             "accuracy": accuracy_score(y_true, y_pred),
-            "precision": precision_score(y_true, y_pred),
-            "recall": recall_score(y_true, y_pred),
-            "f1": f1_score(y_true, y_pred),
+            "precision": precision_score(y_true, y_pred, zero_division=0),
+            "recall": recall_score(y_true, y_pred, zero_division=0),
+            "f1": f1_score(y_true, y_pred, zero_division=0),
             "auc_pr": average_precision_score(y_true, y_proba),
         }
         threshold_results.append(result)
@@ -352,63 +499,136 @@ def tune_decision_threshold(
 
 
 # %%
-def tune_mlp_hyperparameters(X_train, y_train, X_val, y_val) -> tuple[pd.DataFrame, dict, MLPClassifier]:
+def tune_mlp_hyperparameters(
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+) -> tuple[pd.DataFrame, dict, Pipeline]:
     """Tune MLP hyperparameters on the train/validation split."""
     param_grid = {
-        "hidden_layer_sizes": [(64,), (128,), (128, 64)],
-        "activation": ["relu", "tanh"],
-        "learning_rate_init": [0.001, 0.01],
-        "alpha": [0.0001, 0.001, 0.01],
-        "max_iter": [600],
+        "model__hidden_layer_sizes": [(64,), (128, 64), (256, 128, 64)],
+        "model__activation": ["relu", "tanh"],
+        "model__learning_rate_init": [0.001, 0.01, 0.1],
+        "model__max_iter": [300, 600],
     }
 
-    tuning_results = []
-    best_metrics = None
-    best_model = None
-
-    for params in ParameterGrid(param_grid):
-        model = MLPClassifier(
+    base_pipeline = build_model_pipeline(
+        numeric_cols=numeric_cols,
+        categorical_cols=categorical_cols,
+        scale_numeric=True,
+        model=MLPClassifier(
             early_stopping=True,
             random_state=42,
-            **params,
-        )
-
-        start_time = time.time()
-        model.fit(X_train, y_train)
-        train_time = time.time() - start_time
-
-        y_val_pred = model.predict(X_val)
-        y_val_proba = model.predict_proba(X_val)[:, 1]
-
-        result = {
-            **params,
-            "accuracy": accuracy_score(y_val, y_val_pred),
-            "precision": precision_score(y_val, y_val_pred),
-            "recall": recall_score(y_val, y_val_pred),
-            "f1": f1_score(y_val, y_val_pred),
-            "auc_pr": average_precision_score(y_val, y_val_proba),
-            "train_time_sec": train_time,
-        }
-        tuning_results.append(result)
-
-        if (
-            best_metrics is None
-            or result["f1"] > best_metrics["f1"]
-            or (
-                result["f1"] == best_metrics["f1"]
-                and result["auc_pr"] > best_metrics["auc_pr"]
-            )
-        ):
-            best_metrics = result
-            best_model = model
-
-    results_df = (
-        pd.DataFrame(tuning_results)
-        .sort_values(["f1", "auc_pr"], ascending=False)
-        .reset_index(drop=True)
+        ),
     )
 
-    return results_df, best_metrics, best_model
+    grid_search = GridSearchCV(
+        estimator=base_pipeline,
+        param_grid=param_grid,
+        scoring="f1",
+        cv=3,
+        n_jobs=-1,
+        refit=True,
+    )
+
+    start_time = time.time()
+    grid_search.fit(X_train, y_train)
+    total_search_time = time.time() - start_time
+
+    results_df = pd.DataFrame(grid_search.cv_results_)
+    results_df = results_df[
+        [
+            "param_model__hidden_layer_sizes",
+            "param_model__activation",
+            "param_model__learning_rate_init",
+            "param_model__max_iter",
+            "mean_test_score",
+            "std_test_score",
+            "rank_test_score",
+        ]
+    ].rename(
+        columns={
+            "param_model__hidden_layer_sizes": "hidden_layer_sizes",
+            "param_model__activation": "activation",
+            "param_model__learning_rate_init": "learning_rate_init",
+            "param_model__max_iter": "max_iter",
+            "mean_test_score": "cv_f1",
+            "std_test_score": "cv_f1_std",
+        }
+    )
+
+    best_pipeline = grid_search.best_estimator_
+    best_params = {
+        key.replace("model__", ""): value for key, value in grid_search.best_params_.items()
+    }
+    y_train_pred = best_pipeline.predict(X_train)
+    y_val_pred = best_pipeline.predict(X_val)
+    y_val_proba = best_pipeline.predict_proba(X_val)[:, 1]
+
+    best_metrics = {
+        **best_params,
+        "train_accuracy": accuracy_score(y_train, y_train_pred),
+        "train_f1": f1_score(y_train, y_train_pred, zero_division=0),
+        "accuracy": accuracy_score(y_val, y_val_pred),
+        "precision": precision_score(y_val, y_val_pred, zero_division=0),
+        "recall": recall_score(y_val, y_val_pred, zero_division=0),
+        "f1": f1_score(y_val, y_val_pred, zero_division=0),
+        "auc_pr": average_precision_score(y_val, y_val_proba),
+        "train_time_sec": grid_search.refit_time_,
+        "search_time_sec": total_search_time,
+    }
+
+    validation_rows = []
+    raw_param_grid = {
+        "hidden_layer_sizes": [(64,), (128, 64), (256, 128, 64)],
+        "activation": ["relu", "tanh"],
+        "learning_rate_init": [0.001, 0.01, 0.1],
+        "max_iter": [300, 600],
+    }
+    for params in ParameterGrid(raw_param_grid):
+        pipeline = build_model_pipeline(
+            numeric_cols=numeric_cols,
+            categorical_cols=categorical_cols,
+            scale_numeric=True,
+            model=MLPClassifier(
+                early_stopping=True,
+                random_state=42,
+                **params,
+            ),
+        )
+        train_start_time = time.time()
+        pipeline.fit(X_train, y_train)
+        train_time = time.time() - train_start_time
+        y_train_pred = pipeline.predict(X_train)
+        y_val_pred = pipeline.predict(X_val)
+        y_val_proba = pipeline.predict_proba(X_val)[:, 1]
+
+        validation_rows.append(
+            {
+                **params,
+                "train_accuracy": accuracy_score(y_train, y_train_pred),
+                "train_f1": f1_score(y_train, y_train_pred, zero_division=0),
+                "accuracy": accuracy_score(y_val, y_val_pred),
+                "precision": precision_score(y_val, y_val_pred, zero_division=0),
+                "recall": recall_score(y_val, y_val_pred, zero_division=0),
+                "f1": f1_score(y_val, y_val_pred, zero_division=0),
+                "auc_pr": average_precision_score(y_val, y_val_proba),
+                "train_time_sec": train_time,
+            }
+        )
+
+    validation_results_df = pd.DataFrame(validation_rows)
+    results_df = results_df.merge(
+        validation_results_df,
+        on=["hidden_layer_sizes", "activation", "learning_rate_init", "max_iter"],
+        how="left",
+    )
+    results_df = results_df.sort_values(["f1", "auc_pr"], ascending=False).reset_index(drop=True)
+
+    return results_df, best_metrics, best_pipeline
 
 
 # %%
@@ -419,9 +639,9 @@ def evaluate_model_on_test_set(model, X_test, y_test, threshold: float = 0.5) ->
 
     return {
         "accuracy": accuracy_score(y_test, y_test_pred),
-        "precision": precision_score(y_test, y_test_pred),
-        "recall": recall_score(y_test, y_test_pred),
-        "f1": f1_score(y_test, y_test_pred),
+        "precision": precision_score(y_test, y_test_pred, zero_division=0),
+        "recall": recall_score(y_test, y_test_pred, zero_division=0),
+        "f1": f1_score(y_test, y_test_pred, zero_division=0),
         "auc_pr": average_precision_score(y_test, y_test_proba),
     }
 
@@ -466,6 +686,133 @@ def plot_comparison_table(comparison_df: pd.DataFrame, title: str = "GBDT vs MLP
     plt.tight_layout()
     fig.savefig(VIS_DIR / "final_comparison_table.png", dpi=300, bbox_inches="tight")
     plt.show()
+
+
+# %%
+def summarize_final_model_comparison(comparison_df: pd.DataFrame) -> pd.DataFrame:
+    """Summarize which final model leads on each metric and on training time."""
+    summary_rows = []
+    metric_directions = {
+        "accuracy": "max",
+        "precision": "max",
+        "recall": "max",
+        "f1": "max",
+        "auc_pr": "max",
+        "train_time_sec": "min",
+    }
+
+    for metric_name, direction in metric_directions.items():
+        if direction == "max":
+            best_idx = comparison_df[metric_name].idxmax()
+        else:
+            best_idx = comparison_df[metric_name].idxmin()
+
+        summary_rows.append(
+            {
+                "metric": metric_name,
+                "best_model": comparison_df.loc[best_idx, "model"],
+                "best_value": round(comparison_df.loc[best_idx, metric_name], 4),
+            }
+        )
+
+    return pd.DataFrame(summary_rows)
+
+
+def format_transformed_feature_name(feature_name: str, categorical_cols: list[str]) -> str:
+    """Convert transformed column names into cleaner plot labels."""
+    clean_name = feature_name
+    for prefix in ("num__", "cat__", "remainder__", "imputer__", "scaler__", "onehot__"):
+        if clean_name.startswith(prefix):
+            clean_name = clean_name[len(prefix):]
+
+    for col in sorted(categorical_cols, key=len, reverse=True):
+        column_prefix = f"{col}_"
+        if clean_name.startswith(column_prefix):
+            return f"{col} = {clean_name[len(column_prefix):]}"
+
+    return clean_name
+
+
+def get_transformed_feature_names(
+    preprocessor: ColumnTransformer,
+    categorical_cols: list[str],
+) -> list[str]:
+    """Return readable transformed feature names from a fitted preprocessor."""
+    raw_feature_names = preprocessor.get_feature_names_out()
+    return [
+        format_transformed_feature_name(feature_name, categorical_cols)
+        for feature_name in raw_feature_names
+    ]
+
+
+def plot_named_feature_importance(
+    model: XGBClassifier,
+    feature_names: list[str],
+    max_num_features: int = 15,
+):
+    """Plot GBDT feature importances using readable names and rounded labels."""
+    importance_by_feature_id = model.get_booster().get_score(importance_type="gain")
+
+    importance_rows = []
+    for feature_id, importance_value in importance_by_feature_id.items():
+        feature_index = int(feature_id[1:])
+        importance_rows.append(
+            {
+                "feature": feature_names[feature_index],
+                "importance": float(importance_value),
+            }
+        )
+
+    importance_df = (
+        pd.DataFrame(importance_rows)
+        .sort_values("importance", ascending=False)
+        .head(max_num_features)
+        .sort_values("importance", ascending=True)
+        .reset_index(drop=True)
+    )
+
+    fig_height = max(6, 0.5 * len(importance_df) + 1)
+    fig, ax = plt.subplots(figsize=(12, fig_height))
+    bars = ax.barh(importance_df["feature"], importance_df["importance"], color="#2c6fb7")
+
+    max_importance = importance_df["importance"].max()
+    label_offset = max_importance * 0.01 if max_importance > 0 else 0.01
+
+    for bar, importance_value in zip(bars, importance_df["importance"]):
+        ax.text(
+            bar.get_width() + label_offset,
+            bar.get_y() + bar.get_height() / 2,
+            f"{importance_value:.2f}",
+            va="center",
+        )
+
+    ax.set_title("GBDT Feature Importance")
+    ax.set_xlabel("Importance score")
+    ax.set_ylabel("Features")
+    ax.grid(True, axis="x", alpha=0.3)
+    ax.set_xlim(0, max_importance * 1.12 if max_importance > 0 else 1)
+    fig.tight_layout()
+    fig.savefig(VIS_DIR / "gbdt_feature_importance.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+def fit_gbdt_with_monitoring(X_train, y_train, X_val, y_val, params: dict, early_stopping_rounds: int = 20):
+    """Fit a GBDT model with eval_set monitoring and early stopping."""
+    monitoring_model = XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="logloss",
+        colsample_bytree=1.0,
+        random_state=42,
+        early_stopping_rounds=early_stopping_rounds,
+        **params,
+    )
+    monitoring_model.fit(
+        X_train,
+        y_train,
+        eval_set=[(X_train, y_train), (X_val, y_val)],
+        verbose=False,
+    )
+    return monitoring_model
 
 
 # %%
@@ -586,9 +933,9 @@ gbdt_train_accuracy = accuracy_score(y_train, y_train_pred_gbdt)
 
 gbdt_val_metrics = {
     "accuracy": accuracy_score(y_val, y_val_pred_gbdt),
-    "precision": precision_score(y_val, y_val_pred_gbdt),
-    "recall": recall_score(y_val, y_val_pred_gbdt),
-    "f1": f1_score(y_val, y_val_pred_gbdt),
+    "precision": precision_score(y_val, y_val_pred_gbdt, zero_division=0),
+    "recall": recall_score(y_val, y_val_pred_gbdt, zero_division=0),
+    "f1": f1_score(y_val, y_val_pred_gbdt, zero_division=0),
     "auc_pr": average_precision_score(y_val, y_val_proba_gbdt),
 }
 
@@ -601,10 +948,12 @@ for metric_name, metric_value in gbdt_val_metrics.items():
 
 # %%
 gbdt_tuning_results_df, gbdt_best_metrics, gbdt_best_model = tune_gbdt_hyperparameters(
-    X_train_gbdt,
+    X_train,
     y_train,
-    X_val_gbdt,
+    X_val,
     y_val,
+    numeric_cols,
+    categorical_cols,
 )
 
 print("Top 5 tuned GBDT runs by validation F1:")
@@ -615,8 +964,137 @@ print(gbdt_best_metrics)
 
 
 # %%
+gbdt_parameters_to_summarize = [
+    "learning_rate",
+    "n_estimators",
+    "max_depth",
+    "subsample",
+    "reg_alpha",
+    "reg_lambda",
+]
+
+for parameter_name in gbdt_parameters_to_summarize:
+    print(f"\nGBDT parameter effect summary: {parameter_name}")
+    parameter_summary_df = summarize_gbdt_parameter_effects(
+        gbdt_tuning_results_df,
+        parameter_name,
+    )
+    print(parameter_summary_df)
+    plot_gbdt_parameter_summary_table(parameter_summary_df, parameter_name)
+
+
+# %%
+gbdt_monitoring_params = {
+    "learning_rate": gbdt_best_metrics["learning_rate"],
+    "n_estimators": gbdt_best_metrics["n_estimators"],
+    "max_depth": gbdt_best_metrics["max_depth"],
+    "subsample": gbdt_best_metrics["subsample"],
+    "reg_alpha": gbdt_best_metrics["reg_alpha"],
+    "reg_lambda": gbdt_best_metrics["reg_lambda"],
+}
+
+gbdt_monitor_start_time = time.time()
+gbdt_monitored_model = fit_gbdt_with_monitoring(
+    X_train_gbdt,
+    y_train,
+    X_val_gbdt,
+    y_val,
+    gbdt_monitoring_params,
+    early_stopping_rounds=20,
+)
+gbdt_monitored_train_time_sec = time.time() - gbdt_monitor_start_time
+
+gbdt_eval_results = gbdt_monitored_model.evals_result()
+train_logloss = gbdt_eval_results["validation_0"]["logloss"]
+val_logloss = gbdt_eval_results["validation_1"]["logloss"]
+
+plt.figure(figsize=(8, 5))
+plt.plot(train_logloss, label="Train Log Loss", linewidth=2)
+plt.plot(val_logloss, label="Validation Log Loss", linewidth=2)
+plt.title("GBDT Training vs Validation Loss")
+plt.xlabel("Boosting Round")
+plt.ylabel("Log Loss")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(VIS_DIR / "gbdt_train_vs_validation_loss.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# %%
+gbdt_feature_names = get_transformed_feature_names(
+    gbdt_preprocessor,
+    categorical_cols,
+)
+plot_named_feature_importance(
+    gbdt_monitored_model,
+    gbdt_feature_names,
+    max_num_features=15,
+)
+
+
+# %%
+learning_rate_values = [0.01, 0.1, 0.3]
+learning_rate_results = []
+learning_rate_loss_curves = {}
+
+for learning_rate in learning_rate_values:
+    learning_rate_model = fit_gbdt_with_monitoring(
+        X_train_gbdt,
+        y_train,
+        X_val_gbdt,
+        y_val,
+        {
+            "learning_rate": learning_rate,
+            "n_estimators": gbdt_best_metrics["n_estimators"],
+            "max_depth": gbdt_best_metrics["max_depth"],
+            "subsample": gbdt_best_metrics["subsample"],
+            "reg_alpha": gbdt_best_metrics["reg_alpha"],
+            "reg_lambda": gbdt_best_metrics["reg_lambda"],
+        },
+        early_stopping_rounds=20,
+    )
+
+    y_val_pred_lr = learning_rate_model.predict(X_val_gbdt)
+    y_val_proba_lr = learning_rate_model.predict_proba(X_val_gbdt)[:, 1]
+    learning_rate_loss_curves[learning_rate] = learning_rate_model.evals_result()["validation_1"]["logloss"]
+
+    learning_rate_results.append(
+        {
+            "learning_rate": learning_rate,
+            "best_iteration": learning_rate_model.best_iteration,
+            "val_f1": f1_score(y_val, y_val_pred_lr, zero_division=0),
+            "val_auc_pr": average_precision_score(y_val, y_val_proba_lr),
+            "min_val_logloss": min(
+                learning_rate_model.evals_result()["validation_1"]["logloss"]
+            ),
+        }
+    )
+
+learning_rate_results_df = pd.DataFrame(learning_rate_results).sort_values("learning_rate")
+print("GBDT learning rate comparison:")
+print(learning_rate_results_df)
+
+plt.figure(figsize=(9, 5))
+for learning_rate in learning_rate_values:
+    plt.plot(
+        learning_rate_loss_curves[learning_rate],
+        label=f"learning_rate = {learning_rate}",
+        linewidth=2,
+    )
+plt.title("Validation Loss Curves Across Learning Rates")
+plt.xlabel("Boosting Round")
+plt.ylabel("Validation Log Loss")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(VIS_DIR / "gbdt_learning_rate_comparison.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# %%
 threshold_candidates = [0.3, 0.4, 0.5, 0.6, 0.7]
-gbdt_best_val_proba = gbdt_best_model.predict_proba(X_val_gbdt)[:, 1]
+gbdt_best_val_proba = gbdt_monitored_model.predict_proba(X_val_gbdt)[:, 1]
 
 gbdt_threshold_results_df, gbdt_best_threshold_result = tune_decision_threshold(
     y_val,
@@ -664,9 +1142,9 @@ mlp_train_accuracy = accuracy_score(y_train, y_train_pred_mlp)
 
 mlp_val_metrics = {
     "accuracy": accuracy_score(y_val, y_val_pred_mlp),
-    "precision": precision_score(y_val, y_val_pred_mlp),
-    "recall": recall_score(y_val, y_val_pred_mlp),
-    "f1": f1_score(y_val, y_val_pred_mlp),
+    "precision": precision_score(y_val, y_val_pred_mlp, zero_division=0),
+    "recall": recall_score(y_val, y_val_pred_mlp, zero_division=0),
+    "f1": f1_score(y_val, y_val_pred_mlp, zero_division=0),
     "auc_pr": average_precision_score(y_val, y_val_proba_mlp),
 }
 
@@ -678,11 +1156,13 @@ for metric_name, metric_value in mlp_val_metrics.items():
 
 
 # %%
-mlp_tuning_results_df, mlp_best_metrics, mlp_best_model = tune_mlp_hyperparameters(
-    X_train_mlp,
+mlp_tuning_results_df, mlp_best_metrics, mlp_best_pipeline = tune_mlp_hyperparameters(
+    X_train,
     y_train,
-    X_val_mlp,
+    X_val,
     y_val,
+    numeric_cols,
+    categorical_cols,
 )
 
 print("Top 5 tuned MLP runs by validation F1:")
@@ -694,7 +1174,7 @@ print(mlp_best_metrics)
 
 # %%
 plt.figure(figsize=(8, 5))
-plt.plot(mlp_best_model.loss_curve_, linewidth=2)
+plt.plot(mlp_best_pipeline.named_steps["model"].loss_curve_, linewidth=2)
 plt.title("MLP Training Loss Curve")
 plt.xlabel("Iteration")
 plt.ylabel("Loss")
@@ -725,11 +1205,65 @@ plt.show()
 
 
 # %%
-final_gbdt_model = gbdt_best_model
+target_mlp_architecture = (128, 64)
+target_mlp_architecture_results = mlp_tuning_results_df[
+    mlp_tuning_results_df["hidden_layer_sizes"] == target_mlp_architecture
+].sort_values(["f1", "auc_pr"], ascending=False)
+
+if target_mlp_architecture_results.empty:
+    print(f"No tuned MLP runs found for hidden_layer_sizes = {target_mlp_architecture}.")
+else:
+    best_target_mlp_result = target_mlp_architecture_results.iloc[0]
+
+    print(f"Best tuned MLP run for hidden_layer_sizes = {target_mlp_architecture}:")
+    print(
+        best_target_mlp_result[
+            [
+                "hidden_layer_sizes",
+                "activation",
+                "learning_rate_init",
+                "max_iter",
+                "train_accuracy",
+                "train_f1",
+                "accuracy",
+                "precision",
+                "recall",
+                "f1",
+                "auc_pr",
+                "train_time_sec",
+            ]
+        ]
+    )
+
+    print(f"\nOverfitting check for best hidden_layer_sizes = {target_mlp_architecture} MLP:")
+    print(f"Training accuracy: {best_target_mlp_result['train_accuracy']:.4f}")
+    print(f"Validation accuracy: {best_target_mlp_result['accuracy']:.4f}")
+    print(f"Training F1: {best_target_mlp_result['train_f1']:.4f}")
+    print(f"Validation F1: {best_target_mlp_result['f1']:.4f}")
+
+
+# %%
+mlp_best_val_proba = mlp_best_pipeline.predict_proba(X_val)[:, 1]
+
+mlp_threshold_results_df, mlp_best_threshold_result = tune_decision_threshold(
+    y_val,
+    mlp_best_val_proba,
+    threshold_candidates,
+)
+
+print("MLP threshold tuning results:")
+print(mlp_threshold_results_df)
+
+print("\nBest MLP threshold result:")
+print(mlp_best_threshold_result)
+
+
+# %%
+final_gbdt_model = gbdt_monitored_model
 final_gbdt_threshold = gbdt_best_threshold_result["threshold"]
 
-final_mlp_model = mlp_best_model
-final_mlp_threshold = 0.5
+final_mlp_model = mlp_best_pipeline
+final_mlp_threshold = mlp_best_threshold_result["threshold"]
 
 print("Final GBDT configuration:")
 print(gbdt_best_metrics)
@@ -741,17 +1275,145 @@ print(f"Final MLP threshold: {final_mlp_threshold}")
 
 
 # %%
+gbdt_cv_model = build_model_pipeline(
+    numeric_cols=numeric_cols,
+    categorical_cols=categorical_cols,
+    scale_numeric=False,
+    model=XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="logloss",
+        colsample_bytree=1.0,
+        random_state=42,
+        learning_rate=gbdt_best_metrics["learning_rate"],
+        n_estimators=gbdt_best_metrics["n_estimators"],
+        max_depth=gbdt_best_metrics["max_depth"],
+        subsample=gbdt_best_metrics["subsample"],
+        reg_alpha=gbdt_best_metrics["reg_alpha"],
+        reg_lambda=gbdt_best_metrics["reg_lambda"],
+    ),
+)
+
+mlp_cv_model = build_model_pipeline(
+    numeric_cols=numeric_cols,
+    categorical_cols=categorical_cols,
+    scale_numeric=True,
+    model=MLPClassifier(
+        early_stopping=True,
+        random_state=42,
+        hidden_layer_sizes=mlp_best_metrics["hidden_layer_sizes"],
+        activation=mlp_best_metrics["activation"],
+        learning_rate_init=mlp_best_metrics["learning_rate_init"],
+        max_iter=mlp_best_metrics["max_iter"],
+    ),
+)
+
+gbdt_cv_scores = cross_val_score(
+    gbdt_cv_model,
+    X_train,
+    y_train,
+    cv=3,
+    scoring="f1",
+    n_jobs=-1,
+)
+mlp_cv_scores = cross_val_score(
+    mlp_cv_model,
+    X_train,
+    y_train,
+    cv=3,
+    scoring="f1",
+    n_jobs=-1,
+)
+
+cv_summary_df = pd.DataFrame(
+    [
+        {
+            "model": "GBDT",
+            "cv_f1_mean": round(gbdt_cv_scores.mean(), 4),
+            "cv_f1_std": round(gbdt_cv_scores.std(), 4),
+        },
+        {
+            "model": "MLP",
+            "cv_f1_mean": round(mlp_cv_scores.mean(), 4),
+            "cv_f1_std": round(mlp_cv_scores.std(), 4),
+        },
+    ]
+)
+
+print("Cross-validation F1 summary:")
+print(cv_summary_df)
+
+
+# %%
+# Additional diagnostic beyond the tuned search grid: sweep a wider range of
+# max_depth values so the validation-curve plot is informative rather than a
+# two-point comparison.
+gbdt_validation_curve_pipeline = Pipeline(
+    steps=[
+        (
+            "preprocessor",
+            build_preprocessor(
+                numeric_cols=numeric_cols,
+                categorical_cols=categorical_cols,
+                scale_numeric=False,
+            ),
+        ),
+        (
+            "model",
+            XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="logloss",
+                colsample_bytree=1.0,
+                random_state=42,
+                learning_rate=gbdt_best_metrics["learning_rate"],
+                n_estimators=gbdt_best_metrics["n_estimators"],
+                subsample=gbdt_best_metrics["subsample"],
+                reg_alpha=gbdt_best_metrics["reg_alpha"],
+                reg_lambda=gbdt_best_metrics["reg_lambda"],
+            ),
+        ),
+    ]
+)
+
+depth_param_range = [2, 3, 4, 5, 6, 7, 8]
+gbdt_train_scores, gbdt_val_scores = validation_curve(
+    gbdt_validation_curve_pipeline,
+    X_train,
+    y_train,
+    param_name="model__max_depth",
+    param_range=depth_param_range,
+    cv=3,
+    scoring="f1",
+    n_jobs=-1,
+)
+
+gbdt_train_mean = gbdt_train_scores.mean(axis=1)
+gbdt_val_mean = gbdt_val_scores.mean(axis=1)
+
+plt.figure(figsize=(8, 5))
+plt.plot(depth_param_range, gbdt_train_mean, marker="o", linewidth=2, label="Train F1")
+plt.plot(depth_param_range, gbdt_val_mean, marker="o", linewidth=2, label="Validation F1")
+plt.title("GBDT Validation Curve for max_depth")
+plt.xlabel("max_depth")
+plt.ylabel("F1 Score")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(VIS_DIR / "gbdt_validation_curve_max_depth.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# %%
 final_gbdt_test_metrics = evaluate_model_on_test_set(
     final_gbdt_model,
     X_test_gbdt,
     y_test,
     threshold=final_gbdt_threshold,
 )
-final_gbdt_test_metrics["train_time_sec"] = gbdt_best_metrics["train_time_sec"]
+final_gbdt_test_metrics["train_time_sec"] = gbdt_monitored_train_time_sec
 
 final_mlp_test_metrics = evaluate_model_on_test_set(
     final_mlp_model,
-    X_test_mlp,
+    X_test,
     y_test,
     threshold=final_mlp_threshold,
 )
@@ -773,3 +1435,7 @@ final_comparison_table = build_comparison_table(
 print("Final GBDT vs MLP comparison table:")
 print(final_comparison_table)
 plot_comparison_table(final_comparison_table)
+
+final_comparison_summary = summarize_final_model_comparison(final_comparison_table)
+print("\nFinal comparison summary:")
+print(final_comparison_summary)
